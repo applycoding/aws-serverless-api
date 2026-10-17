@@ -1,0 +1,8 @@
+-r src/requirements.txt
+# aws-sam-cli 1.169 requires boto3==1.43.108, pydantic~=2.13.3, and cfn-lint>=1.52,<1.54.
+boto3==1.43.108
+moto[dynamodb,sqs,events]==5.2.4
+pytest==9.1.1
+ruff==0.17.1
+cfn-lint==1.53.3
+aws-sam-cli==1.169.0

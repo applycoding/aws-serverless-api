@@ -1,0 +1,318 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Bookings REST API. API Gateway HTTP API, Python 3.12 Lambdas, DynamoDB,
+  SQS, EventBridge, and Cognito. Portfolio demo. This stack has never been deployed.
+
+Parameters:
+  ConfirmationTimeoutMinutes:
+    Type: String
+    Default: "30"
+    AllowedPattern: "^[1-9][0-9]*$"
+    Description: Minutes a booking may stay PENDING before the hourly cleanup expires it.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures:
+      - x86_64
+    Timeout: 10
+    MemorySize: 256
+    Tracing: Active
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: bookings-api
+        POWERTOOLS_LOG_LEVEL: INFO
+        TABLE_NAME: !Ref BookingsTable
+        IDEMPOTENCY_TABLE_NAME: !Ref IdempotencyTable
+        CONFIRMATION_QUEUE_URL: !Ref ConfirmationQueue
+        EVENT_BUS_NAME: !Ref BookingsEventBus
+        CONFIRMATION_TIMEOUT_MINUTES: !Ref ConfirmationTimeoutMinutes
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-users
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      MfaConfiguration: "OFF"
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${AWS::StackName}-bookings
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  BookingsHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: "$default"
+      FailOnWarnings: true
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowHeaders:
+          - Authorization
+          - Content-Type
+          - Idempotency-Key
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+        MaxAge: 600
+      Auth:
+        DefaultAuthorizer: CognitoJwt
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              audience:
+                - !Ref UserPoolClient
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+
+  BookingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: userPK
+          AttributeType: S
+        - AttributeName: userSK
+          AttributeType: S
+        - AttributeName: statusPK
+          AttributeType: S
+        - AttributeName: statusSK
+          AttributeType: S
+        - AttributeName: resourcePK
+          AttributeType: S
+        - AttributeName: resourceSK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: UserBookings
+          KeySchema:
+            - AttributeName: userPK
+              KeyType: HASH
+            - AttributeName: userSK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: StatusCreated
+          KeySchema:
+            - AttributeName: statusPK
+              KeyType: HASH
+            - AttributeName: statusSK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: ResourceSchedule
+          KeySchema:
+            - AttributeName: resourcePK
+              KeyType: HASH
+            - AttributeName: resourceSK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiration
+        Enabled: true
+
+  ConfirmationDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  ConfirmationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 180
+      MessageRetentionPeriod: 345600
+      ReceiveMessageWaitTimeSeconds: 10
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ConfirmationDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  BookingsEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub ${AWS::StackName}-bookings
+
+  BookingsApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: bookings.handlers.api.handler
+      Description: HTTP API for creating, reading, updating, and cancelling bookings.
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BookingsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IdempotencyTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ConfirmationQueue.QueueName
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref BookingsEventBus
+      Events:
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BookingsHttpApi
+            Method: GET
+            Path: /health
+            PayloadFormatVersion: "2.0"
+            Auth:
+              Authorizer: NONE
+        ListBookings:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BookingsHttpApi
+            Method: GET
+            Path: /bookings
+            PayloadFormatVersion: "2.0"
+            Auth:
+              Authorizer: CognitoJwt
+        CreateBooking:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BookingsHttpApi
+            Method: POST
+            Path: /bookings
+            PayloadFormatVersion: "2.0"
+            Auth:
+              Authorizer: CognitoJwt
+        GetBooking:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BookingsHttpApi
+            Method: GET
+            Path: /bookings/{bookingId}
+            PayloadFormatVersion: "2.0"
+            Auth:
+              Authorizer: CognitoJwt
+        UpdateBooking:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BookingsHttpApi
+            Method: PUT
+            Path: /bookings/{bookingId}
+            PayloadFormatVersion: "2.0"
+            Auth:
+              Authorizer: CognitoJwt
+        CancelBooking:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BookingsHttpApi
+            Method: DELETE
+            Path: /bookings/{bookingId}
+            PayloadFormatVersion: "2.0"
+            Auth:
+              Authorizer: CognitoJwt
+
+  ConfirmBookingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: bookings.handlers.confirm.handler
+      Description: Confirms pending bookings from the SQS queue.
+      Timeout: 30
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BookingsTable
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref BookingsEventBus
+      Events:
+        ConfirmationQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ConfirmationQueue.Arn
+            BatchSize: 5
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  ExpireBookingsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: bookings.handlers.cleanup.handler
+      Description: Expires PENDING bookings older than the confirmation timeout.
+      Timeout: 60
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BookingsTable
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref BookingsEventBus
+      Events:
+        Hourly:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+            Description: Expire bookings that stay PENDING past the confirmation timeout
+            Enabled: true
+
+Outputs:
+  HttpApiUrl:
+    Description: HTTP API invoke URL. Empty until the stack is deployed. This demo has not been deployed.
+    Value: !Sub https://${BookingsHttpApi}.execute-api.${AWS::Region}.amazonaws.com
+  UserPoolId:
+    Description: Cognito user pool id. Unset until deploy.
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Cognito app client id. The client has no secret. Unset until deploy.
+    Value: !Ref UserPoolClient
+  BookingsTableName:
+    Description: Single-table bookings table. Unset until deploy.
+    Value: !Ref BookingsTable
+  ConfirmationQueueUrl:
+    Description: Queue the API uses to request confirmation. Unset until deploy.
+    Value: !Ref ConfirmationQueue
+  BookingsEventBusName:
+    Description: Custom bus for BookingCreated, BookingConfirmed, BookingCancelled, and BookingExpired.
+    Value: !Ref BookingsEventBus

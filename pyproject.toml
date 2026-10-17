@@ -1,0 +1,23 @@
+[project]
+name = "aws-serverless-api"
+version = "0.1.0"
+description = "Serverless bookings REST API on API Gateway, Lambda, DynamoDB, SQS, EventBridge, and Cognito."
+requires-python = ">=3.12"
+readme = "README.md"
+license = "MIT"
+
+[tool.pytest.ini_options]
+pythonpath = [".", "src"]
+testpaths = ["tests"]
+addopts = "-q --tb=short"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["bookings"]

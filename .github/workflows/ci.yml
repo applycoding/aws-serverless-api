@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    name: lint, pytest, sam validate, cfn-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SAM_CLI_TELEMETRY: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            src/requirements.txt
+            requirements-dev.txt
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Ruff
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Pytest
+        run: pytest
+
+      - name: SAM validate
+        run: sam validate --lint --template-file template.yaml --region us-east-1
+
+      - name: cfn-lint
+        run: cfn-lint template.yaml
